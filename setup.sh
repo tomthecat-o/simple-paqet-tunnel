@@ -1,13 +1,12 @@
 #!/bin/bash
 
 # =========================================================
-#  PAQET TUNNEL
+#  PAQET TUNNEL: MULTI-PORT FORWARD
 # =========================================================
 
 # --- CONFIGURATION ---
 PAQET_VERSION="v1.0.0-alpha.15"
 PAQET_URL="https://github.com/hanselime/paqet/releases/download/${PAQET_VERSION}/paqet-linux-amd64-${PAQET_VERSION}.tar.gz"
-XUI_URL="https://github.com/MHSanaei/3x-ui/releases/download/v2.8.7/x-ui-linux-amd64.tar.gz"
 
 # Colors
 RED='\033[0;31m'
@@ -113,7 +112,7 @@ setup_firewall_bypass() {
 }
 
 # =========================================================
-#  PAQET SETUP (TUNED: CONN 32 + 2MB BUFFER)
+#  PAQET SETUP (TUNED: CONN  + 2MB BUFFER + MULTI-FORWARD)
 # =========================================================
 setup_paqet() {
     print_info "Setting up Paqet ($PAQET_PORT)..."
@@ -133,7 +132,7 @@ role: "server"
 log:
   level: "info"
 listen:
-  addr: ":$PAQET_PORT"
+  addr: "0.0.0.0:$PAQET_PORT"
 network:
   interface: "$IFACE"
   ipv4:
@@ -144,19 +143,35 @@ network:
     remote_flag: ["PA"]
 transport:
   protocol: "kcp"
-  conn: 32
+  conn: 16
   kcp:
     mode: "fast"
     key: "$KEY"
 EOF
         CMD="/root/paqet run -c /root/paqet_server.yaml"
     else
+        # Parse multiple port forwards dynamically
+        FORWARD_YAML="forward:"
+        IFS=',' read -ra MAPS <<< "$PORT_MAPPINGS"
+        for m in "${MAPS[@]}"; do
+            m=$(echo "$m" | tr -d ' ')
+            LP=$(echo "$m" | cut -d':' -f1)
+            RP=$(echo "$m" | cut -d':' -f2)
+            if [ -n "$LP" ] && [ -n "$RP" ]; then
+                FORWARD_YAML="${FORWARD_YAML}
+  - listen: \"0.0.0.0:${LP}\"
+    target: \"127.0.0.1:${RP}\"
+    protocol: \"tcp\""
+            fi
+        done
+
         cat <<EOF > /root/paqet_client.yaml
 role: "client"
 log:
   level: "info"
 socks5:
   - listen: "127.0.0.1:1080"
+$FORWARD_YAML
 network:
   interface: "$IFACE"
   ipv4:
@@ -171,7 +186,7 @@ server:
   addr: "$REMOTE_IP:$PAQET_PORT"
 transport:
   protocol: "kcp"
-  conn: 32
+  conn: 16
   kcp:
     mode: "fast"
     key: "$KEY"
@@ -197,16 +212,35 @@ EOF
 }
 
 verify_paqet_client() {
-    print_info "Verifying Connection..."
+    print_info "Verifying Connection & Ports..."
     sleep 5
+    
+    # 1. Verify Tunnel connectivity via SOCKS5 test port
     TUNNEL_IP=$(curl -s --max-time 10 --socks5-hostname 127.0.0.1:1080 http://api.ipify.org)
+    
     if [ -z "$TUNNEL_IP" ]; then
-        print_error "Verification Failed! Tunnel is not passing traffic."
+        print_error "Verification Failed! Tunnel is not passing traffic to Kharej."
     elif [ "$TUNNEL_IP" == "$PUBLIC_IP" ]; then
-        print_warn "Connected, but IP matches local ($TUNNEL_IP). Routing issue."
+        print_warn "Connected, but IP matches Iran local ($TUNNEL_IP). Routing issue."
     else
-        print_success "TUNNEL CONFIRMED! Traffic exiting via: $TUNNEL_IP"
+        print_success "TUNNEL CONFIRMED! Traffic exiting via Kharej IP: $TUNNEL_IP"
     fi
+
+    # 2. Verify all port forwarding rules are active
+    echo "----------------------------------------"
+    IFS=',' read -ra MAPS <<< "$PORT_MAPPINGS"
+    for m in "${MAPS[@]}"; do
+        m=$(echo "$m" | tr -d ' ')
+        LP=$(echo "$m" | cut -d':' -f1)
+        RP=$(echo "$m" | cut -d':' -f2)
+        if [ -n "$LP" ]; then
+            if ss -tln | grep -q ":$LP "; then
+                print_success "Forwarded Port $LP is listening (Routing to Kharej $RP)"
+            else
+                print_error "Forwarded Port $LP failed to bind! (Is another app using this port?)"
+            fi
+        fi
+    done
 }
 
 # =========================================================
@@ -215,34 +249,24 @@ verify_paqet_client() {
 setup_watchdog() {
     print_info "Setting up Connection Watchdog..."
     
-    # Create Watchdog Script
     cat <<EOF > /usr/local/bin/paqet_watchdog.sh
 #!/bin/bash
-# Checks Paqet connection. If failed, restarts service.
-
 LOGFILE="/var/log/paqet_watchdog.log"
 TARGET="http://api.ipify.org"
 PROXY="socks5h://127.0.0.1:1080"
 
-# Check connection with timeout
 HTTP_CODE=\$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 --proxy "\$PROXY" "\$TARGET")
 
 if [ "\$HTTP_CODE" != "200" ]; then
     echo "\$(date): Connection Failed (Code: \$HTTP_CODE). Restarting Paqet..." >> \$LOGFILE
     systemctl restart paqet
-else
-    # Uncomment next line for verbose success logging
-    # echo "\$(date): Connection OK." >> \$LOGFILE
-    :
 fi
 EOF
     chmod +x /usr/local/bin/paqet_watchdog.sh
 
-    # Create Systemd Timer (Runs every 30 minutes)
     cat <<EOF > /etc/systemd/system/paqet-watchdog.service
 [Unit]
 Description=Paqet Connection Watchdog
-
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/paqet_watchdog.sh
@@ -251,11 +275,9 @@ EOF
     cat <<EOF > /etc/systemd/system/paqet-watchdog.timer
 [Unit]
 Description=Run Paqet Watchdog every 30 minutes
-
 [Timer]
 OnBootSec=30min
 OnUnitActiveSec=30min
-
 [Install]
 WantedBy=timers.target
 EOF
@@ -267,79 +289,12 @@ EOF
 }
 
 # =========================================================
-#  IRAN-ONLY: X-UI SETUP
-# =========================================================
-setup_iran_xui() {
-    echo ""; echo -e "${CYAN}--- X-UI INSTALLATION ---${NC}"
-    echo "1) Install/Update 3X-UI Panel"
-    echo "2) Skip (I have it installed or will install later)"
-    read -p "Select [1-2]: " XCHOICE
-    XCHOICE=${XCHOICE:-2}
-
-    if [ "$XCHOICE" == "1" ]; then
-        print_info "Installing X-UI..."
-        cd /root
-        get_file "X-UI Panel" "$XUI_URL" "x-ui.tar.gz"
-        systemctl stop x-ui >/dev/null 2>&1
-        rm -rf /usr/local/x-ui
-        tar zxf x-ui.tar.gz
-        mv x-ui /usr/local/
-        chmod +x /usr/local/x-ui/x-ui
-        chmod +x /usr/local/x-ui/x-ui.sh
-        rm -f /usr/bin/x-ui
-        ln -s /usr/local/x-ui/x-ui.sh /usr/bin/x-ui
-        cat <<EOF > /etc/systemd/system/x-ui.service
-[Unit]
-Description=X-UI Service
-After=network.target
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/usr/local/x-ui
-ExecStart=/usr/local/x-ui/x-ui
-Restart=on-failure
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload
-        systemctl enable x-ui
-        systemctl start x-ui
-        print_info "Initializing..."
-        sleep 5
-        print_success "X-UI Installed Successfully."
-    else
-        print_info "Skipping X-UI installation."
-    fi
-
-    echo ""; echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN}      IRAN SETUP COMPLETE               ${NC}"
-    echo -e "${GREEN}========================================${NC}"
-    verify_paqet_client
-    echo "----------------------------------------"
-    echo -e "1. Paqet Tunnel: Connected to Kharej"
-    echo -e "2. X-UI Panel:   http://$PUBLIC_IP:2053"
-    echo -e "   Login:        admin / admin"
-    echo -e "   Command:      Type ${YELLOW}x-ui${NC} to manage"
-    echo ""
-    echo -e "${YELLOW}IMPORTANT FINAL STEP:${NC}"
-    echo "1. Log into X-UI Panel."
-    echo "2. Go to [Panel Settings] -> [Xray Configuration]."
-    echo "3. Add outbound (Third Block) to point to Paqet:"
-    echo "   - Protocol: socks"
-    echo "   - Address:  127.0.0.1"
-    echo "   - Port:     1080"
-    echo "4. Click Save & Restart Xray."
-    echo "5. Create your Inbounds (VMess/VLESS) normally."
-    echo -e "${GREEN}========================================${NC}"
-}
-
-# =========================================================
 #  MAIN EXECUTION
 # =========================================================
 check_root
 clear
 echo -e "${CYAN}==========================================================${NC}"
-echo -e "${CYAN}   PAQET TUNNEL                                           ${NC}"
+echo -e "${CYAN}   PAQET TUNNEL: MULTI-PORT FORWARD                       ${NC}"
 echo -e "${CYAN}==========================================================${NC}"
 echo "1) Kharej Server (Tunnel Exit)"
 echo "2) Iran Server   (Tunnel Entry + Bridge)"
@@ -359,6 +314,10 @@ else
     echo ""; echo -e "${CYAN}--- KHAREJ DETAILS ---${NC}"
     read -p "Kharej Server IP: " REMOTE_IP
     read -p "Secret Key (from Kharej): " KEY
+    echo ""
+    echo -e "${YELLOW}Enter Port Forwards (IranPort:KharejPort)${NC}"
+    echo "Example: 2082:2081,2084:2085"
+    read -p "Mappings: " PORT_MAPPINGS
 fi
 
 setup_paqet
@@ -374,5 +333,13 @@ if [ "$ROLE" == "server" ]; then
     echo -e "${GREEN}========================================${NC}"
 else
     setup_watchdog
-    setup_iran_xui
+    
+    echo ""; echo -e "${GREEN}========================================${NC}"
+    echo -e "${GREEN}      IRAN SETUP COMPLETE               ${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    verify_paqet_client
+    echo "----------------------------------------"
+    echo -e "Traffic coming into Iran on the ports you"
+    echo -e "specified is now securely routing to Kharej."
+    echo -e "${GREEN}========================================${NC}"
 fi
