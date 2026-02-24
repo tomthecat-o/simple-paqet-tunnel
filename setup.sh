@@ -5,7 +5,7 @@
 # =========================================================
 
 # --- CONFIGURATION ---
-PAQET_VERSION="v1.0.0-alpha.15"
+PAQET_VERSION="v1.0.0-alpha.18"
 PAQET_URL="https://github.com/hanselime/paqet/releases/download/${PAQET_VERSION}/paqet-linux-amd64-${PAQET_VERSION}.tar.gz"
 
 # Colors
@@ -294,7 +294,7 @@ EOF
 check_root
 clear
 echo -e "${CYAN}==========================================================${NC}"
-echo -e "${CYAN}   PAQET TUNNEL: MULTI-PORT FORWARD                       ${NC}"
+echo -e "${CYAN}   PAQET TUNNEL: MULTI-PORT FORWARD   v18                 ${NC}"
 echo -e "${CYAN}==========================================================${NC}"
 echo "1) Kharej Server (Tunnel Exit)"
 echo "2) Iran Server   (Tunnel Entry + Bridge)"
