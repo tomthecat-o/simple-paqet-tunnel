@@ -5,7 +5,7 @@
 # =========================================================
 
 # --- CONFIGURATION ---
-PAQET_VERSION="v1.0.0-alpha.18"
+PAQET_VERSION="v1.0.0-alpha.19"
 PAQET_URL="https://github.com/hanselime/paqet/releases/download/${PAQET_VERSION}/paqet-linux-amd64-${PAQET_VERSION}.tar.gz"
 
 # Colors
